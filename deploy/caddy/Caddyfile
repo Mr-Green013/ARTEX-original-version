@@ -1,0 +1,31 @@
+# Caddy reverse proxy หน้า ARTEX — TLS อัตโนมัติ + Basic Auth + IP allowlist
+# ตัวแปรมาจาก environment ของ service caddy (ดู docker-compose.prod.yml)
+
+{$ARTEX_DOMAIN} {
+	# จำกัดเฉพาะ CIDR ที่อนุญาต (office/VPN). ที่เหลือ 403
+	@blocked not remote_ip {$ARTEX_ALLOW_CIDR}
+	respond @blocked "Forbidden" 403
+
+	# ชั้น auth เพิ่ม (นอกเหนือ login ของ ARTEX)
+	basic_auth {
+		{$ARTEX_BASICAUTH_USER} {$ARTEX_BASICAUTH_HASH}
+	}
+
+	# security headers ที่ ARTEX ไม่ได้ตั้งเอง
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# ส่งต่อไป ARTEX ภายใน network — รองรับ WebSocket (live session stream) ในตัว
+	reverse_proxy artex:8787
+
+	encode zstd gzip
+	log {
+		output stdout
+		format console
+	}
+}

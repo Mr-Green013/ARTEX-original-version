@@ -1,0 +1,118 @@
+# ARTEX — production/hardened compose
+# ---------------------------------------------------------------------------
+# อ่าน deploy/README-hardening.md ก่อนใช้งานจริง
+#
+# หลักการ:
+#  - ARTEX และ Postgres อยู่ใน network ภายใน (internal) ที่แยกจาก network ขาออก
+#  - ไม่ publish พอร์ตของ ARTEX/Postgres ออก host ตรง ๆ — เข้าผ่าน Caddy (TLS + auth) เท่านั้น
+#  - พอร์ต 8788 (traffic MITM proxy) ไม่ publish ออกไปไหนเด็ดขาด
+#  - no-new-privileges, drop capabilities, resource limits, log rotation
+#
+# ใช้งาน:
+#   cp deploy/.env.prod.example .env   &&  แก้ค่า secrets ให้ครบ
+#   docker compose -f deploy/docker-compose.prod.yml up -d
+# ---------------------------------------------------------------------------
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-artex}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - backend            # internal only — ไม่มีทางออกเน็ต, เข้าได้แค่จาก artex
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB:-artex}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    logging: *default-logging
+    # ไม่มี ports: — Postgres เข้าถึงได้เฉพาะภายใน network backend
+
+  artex:
+    image: autumn27/artex:${ARTEX_TAG:-latest}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ARTEX_PG_DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-artex}?sslmode=disable
+      # LLM: แนะนำตั้งใน UI (System → LLM) หรือ secrets manager แทนการ hardcode ใน .env
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ARTEX_LLM_PROVIDER: ${ARTEX_LLM_PROVIDER:-}
+      ARTEX_LLM_MODEL: ${ARTEX_LLM_MODEL:-}
+      ARTEX_LLM_BASE_URL: ${ARTEX_LLM_BASE_URL:-}
+      ARTEX_LLM_PROXY: ${ARTEX_LLM_PROXY:-}
+    volumes:
+      - ./data:/app/data
+      - ./skills:/app/skills
+    networks:
+      - backend            # คุยกับ postgres
+      - egress             # ทางออกไปยัง target/LLM (คุมด้วย firewall ข้างนอก)
+      - web                # ให้ caddy เข้ามา reverse proxy
+    # publish เฉพาะ 127.0.0.1 เผื่อ debug บน host — production จริงเข้าผ่าน caddy เท่านั้น
+    # 8788 (traffic MITM proxy) ตั้งใจไม่ publish
+    ports:
+      - "127.0.0.1:8787:8787"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_RAW            # ให้ nmap ทำ SYN/ICMP scan ได้ (ตัดออกถ้าไม่ต้องการ raw scan)
+      - NET_BIND_SERVICE
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
+    restart: unless-stopped
+    logging: *default-logging
+
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      - artex
+    ports:
+      - "443:443"
+      - "80:80"
+    environment:
+      ARTEX_DOMAIN: ${ARTEX_DOMAIN:?set in .env}
+      ARTEX_BASICAUTH_USER: ${ARTEX_BASICAUTH_USER:?set in .env}
+      ARTEX_BASICAUTH_HASH: "${ARTEX_BASICAUTH_HASH:?set ARTEX_BASICAUTH_HASH in .env}"
+      ARTEX_ALLOW_CIDR: ${ARTEX_ALLOW_CIDR:-0.0.0.0/0}
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - web
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    logging: *default-logging
+
+networks:
+  backend:
+    internal: true          # ไม่มีทางออกเน็ต (postgres ปลอดภัยขึ้น)
+  egress:
+    driver: bridge          # ทางออกสำหรับ scan target + เรียก LLM
+  web:
+    driver: bridge
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
